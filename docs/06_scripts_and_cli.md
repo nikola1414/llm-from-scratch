@@ -66,7 +66,7 @@ along the way and their fixes:
 | `KeyError: 'é'` in `encode` | prompt char not in training vocab | `CharTokenizer.encode` skips unknown chars |
 | `IndexError: index out of range in self` | context longer than `block_size` | crop the context in `generate` |
 | `RuntimeError: Expected all tensors to be on the same device` | prompt tensor on CPU, model on GPU | create tensors with `device=device` |
-| `RuntimeError: cannot sample n_sample <= 0 samples` / empty input | empty prompt | fall back to a single token |
+| `IndexError: index -1 is out of bounds for dimension 1 with size 0` | empty prompt (context has no tokens) | fall back to a single token |
 | `AttributeError: Can't get attribute 'GPTLanguageModel'` on unpickling | class not importable | import `gpt` before `pickle.load` |
 
 ## Fixing errors + GPU memory
