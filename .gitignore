@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+cuda/
+# Large generated artifacts
+*.pkl
+*.pt
+openwebtext/
+data/output_train.txt
+data/output_val.txt
+data/vocab.txt
