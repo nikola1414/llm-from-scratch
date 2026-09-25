@@ -58,4 +58,4 @@ jupyter notebook          # opens the browser; open notebooks/ and pick the kern
 ```
 
 Notebooks are ideal for experimenting cell-by-cell; once the code is stable we port it
-to plain scripts in `scripts/` (see docs/08_scripts_and_cli.md).
+to plain scripts in `scripts/` (see docs/06_scripts_and_cli.md).
