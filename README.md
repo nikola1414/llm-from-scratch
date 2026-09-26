@@ -1,11 +1,24 @@
 # LLM from scratch
 
-A character-level GPT built from first principles in Python and PyTorch. It starts with
-a bigram model trained on a Wizard of Oz book and ends with a decoder-only transformer that
-trains on OpenWebText and completes prompts in an interactive chatbot.
+A GPT language model built from first principles in Python and PyTorch, in two versions:
 
-Everything is written by hand: the tokenizer, data loaders, attention heads, transformer
-blocks, training loop, checkpointing and sampling. Only `torch` is used for tensors,
+* **v1 (`notebooks/`, `scripts/`)** follows the course step by step. It starts with a
+  bigram model trained on a Wizard of Oz book and ends with a character-level
+  transformer that trains on OpenWebText and completes prompts.
+* **v2 (`llm/`)** is the improved model, built with what modern LLMs use:
+  - a byte-level BPE tokenizer trained from scratch,
+  - RoPE, RMSNorm, SwiGLU, grouped-query attention, fused attention and weight tying,
+  - warm-up plus cosine learning rate, gradient clipping and accumulation, mixed
+    precision and `torch.compile`,
+  - memory-mapped token datasets, safe checkpoints and a KV cache,
+  - top-p sampling, instruction finetuning and a chat mode,
+  - a test suite that runs in CI.
+
+  On the same model size and number of steps it reaches **15% lower bits per character**
+  than v1 (2.07 vs 2.43), and the tuned version reaches **2.03**. See [v2](#v2-the-improved-model).
+
+Everything is written by hand: the tokenizers, data loaders, attention, transformer
+blocks, training loops, checkpointing and sampling. Only `torch` is used for tensors,
 autograd and the optimizer.
 
 ```
@@ -29,7 +42,8 @@ python scripts/training.py --data wizard --batch_size 32 --block_size 64 \
 python scripts/chatbot.py --model_path model-01.pkl
 ```
 
-For the full dataset, see [Training on OpenWebText](#training-on-openwebtext).
+For the full dataset, see [Training on OpenWebText](#training-on-openwebtext). To chat
+with the shipped v2 model right away, run `python -m llm.generate --ckpt models/oz-chat.pt --chat`.
 
 ## Repository layout
 
@@ -44,12 +58,28 @@ For the full dataset, see [Training on OpenWebText](#training-on-openwebtext).
 │   ├── 04_normalization_and_activations.ipynb
 │   ├── 05_self_attention.ipynb
 │   ├── 06_gpt_v1.ipynb
-│   └── 07_gpt_openwebtext.ipynb
-├── scripts/
+│   ├── 07_gpt_openwebtext.ipynb
+│   └── 08_gpt_v2.ipynb              tour of v2: BPE, RoPE, checkpoints, KV cache, chat
+├── scripts/                         v1
 │   ├── gpt.py                       model + tokenizer (shared module)
 │   ├── data_extract.py              OpenWebText .xz → train/val/vocab
 │   ├── training.py                  CLI training / resume / pickle
 │   └── chatbot.py                   prompt → completion
+├── llm/                             v2
+│   ├── tokenizer.py                 byte-level BPE + char tokenizers
+│   ├── model.py                     GPT: RoPE, RMSNorm, SwiGLU, GQA, SDPA, KV cache
+│   ├── data.py, prepare.py          text → uint16 token files, memmap batches
+│   ├── train.py                     pretraining loop
+│   ├── finetune.py                  instruction finetuning (prompt-masked loss)
+│   ├── evaluate.py                  full-split loss / perplexity / bits per char
+│   ├── generate.py                  streaming sampling + chat
+│   └── checkpoint.py, utils.py
+├── models/                          shipped v2 checkpoints (3.5 MB each)
+│   ├── oz-base.pt                   pretrained on the book
+│   └── oz-chat.pt                   + instruction finetuned on data/oz_sft.jsonl
+├── data/oz_sft.jsonl                156 Q&A pairs about the book (with paraphrases)
+├── experiments/                     ablation script + result tables
+├── tests/                           pytest suite (also run by GitHub Actions)
 ├── docs/                            concept notes for each stage
 └── requirements.txt
 ```
@@ -99,8 +129,9 @@ Every topic below is covered either in a notebook (code you can run) or a doc (n
 | 37 | `nn.Module` inheritance, generation cropping | `scripts/gpt.py`, docs/06 |
 | 38 | Pretraining vs finetuning | [docs/07_pretraining_vs_finetuning.md](docs/07_pretraining_vs_finetuning.md) |
 | 39 | R&D pointers | [docs/08_rnd_pointers.md](docs/08_rnd_pointers.md) |
+| 40 | v2: applying the R&D pointers | [llm/](llm), [08_gpt_v2](notebooks/08_gpt_v2.ipynb), [docs/09_v2_improvements.md](docs/09_v2_improvements.md) |
 
-## Results
+## Results (v1)
 
 These results come from runs on a 4-core CPU with the Wizard of Oz text, as saved in the
 notebooks:
@@ -122,6 +153,84 @@ the Wizard ustaned Dorothy, ruled apped the tup inny, and I as the wood ...
 It has learned words, names from the book, dialogue punctuation and paragraph structure.
 A bigger model on a GPU gets much further. Try
 `--batch_size 64 --block_size 256 --n_embd 384 --n_head 8 --n_layer 8 --max_iters 5000`.
+
+## v2: the improved model
+
+### Use it
+
+```bash
+# chat with the shipped model (no training needed)
+python -m llm.generate --ckpt models/oz-chat.pt --chat
+python -m llm.generate --ckpt models/oz-base.pt --prompt "Dorothy looked at the Wizard"
+
+# reproduce it: tokenize → pretrain → finetune → evaluate  (~15 min on a laptop CPU)
+python -m llm.prepare  --input data/wizard_of_oz.txt --out_dir data/oz_bpe512 --vocab_size 512
+python -m llm.train    --data_dir data/oz_bpe512 --out_dir runs/oz --preset cpu-tiny \
+                       --dropout 0.3 --weight_decay 0.5 --max_iters 1500 --eval_interval 100
+python -m llm.finetune --ckpt runs/oz/best.pt --data data/oz_sft.jsonl --out_dir runs/oz_chat \
+                       --epochs 25 --dropout 0.1 --lr 5e-4
+python -m llm.evaluate --ckpt runs/oz/best.pt
+python -m llm.generate --ckpt runs/oz_chat/last.pt --chat
+
+python -m pytest -q    # 31 tests
+```
+
+What changed and why is explained in [docs/09_v2_improvements.md](docs/09_v2_improvements.md).
+Every change has a command-line switch (`--pos_emb`, `--norm`, `--mlp`, `--n_kv_head`,
+`--no_tie`, `--tokenizer`, …), so each one can be tested on its own.
+
+### Ablation: what each change buys
+
+All runs use 4 layers, 4 heads, 128 dimensions and 2000 steps on a CPU, with the same
+80/20 split as v1. The metric is **bits per character on the whole validation text**
+(lower is better). It is the fair comparison between character and BPE models. Script:
+[experiments/ablation.sh](experiments/ablation.sh).
+
+| run | tokenizer | val bits/char | vs v1 |
+|---|---|---|---|
+| v1 baseline (v1 architecture and training recipe) | char | 2.431 | — |
+| v1 architecture + v2 training recipe (warm-up/cosine lr, AdamW β₂ 0.99, wd 0.1, clipping, 128 context) | char | 2.113 | −13.1% |
+| v2 architecture + v2 recipe | char | **2.070** | −14.9% |
+| v2, BPE 512 / 1024 / 2048 | bpe | 2.124 / 2.130 / 2.133 | −12.6% |
+
+Tuning on top of that ([experiments/results_final.md](experiments/results_final.md)):
+
+| run | params | val bits/char |
+|---|---|---|
+| **v2, BPE 512, dropout 0.3, weight decay 0.5** (shipped as `models/oz-base.pt`) | 0.87M | **2.034** (−16.3% vs v1) |
+| v2, char, 6 layers / 192 dims / GQA | 1.87M | 2.064 |
+| v2, BPE 512, 6 layers / 192 dims / GQA, regularized | 2.46M | 2.075 |
+
+What the experiments show:
+
+* **The training recipe is the biggest single win**, and the modern architecture adds
+  to it.
+* **This corpus is small: one book, 230 KB.** BPE models see about 2–3× more text per
+  step and memorize it within a few hundred steps: training loss keeps falling while
+  validation loss rises. With strong regularization (dropout 0.3, weight decay 0.5), BPE
+  becomes the best option. Larger models get worse here, because the data, not the
+  model size, is what limits results. On OpenWebText the opposite holds: use BPE with a
+  16k–32k vocabulary and the `gpu-medium` / `gpt-small` presets.
+* The KV cache gives a **2.4× faster** generation even on this small model (notebook 08).
+
+### Chat model: what to expect
+
+After instruction finetuning, the model answers in full sentences and stops at the end
+of its turn:
+
+```
+> Who is Jim?
+Jim is the cab-horse. He is old and very thin, but he can talk once they reach the fairy countries.
+> Can you tell me about the Braided Man?
+The Braided Man lives in Pyramid Mountain. His hair and his beard are braided, and he makes Assorted Flutters and Rustles.
+```
+
+With about 1M parameters trained on a single book, it **recalls** answers it saw in
+finetuning, including rephrased versions of those questions. It cannot reason about
+genuinely new questions: ask "Where does Ozma live?" and you get a fluent but wrong
+answer. Real assistant behaviour needs orders of magnitude more pretraining data and
+parameters. The code here scales to that (see
+[Training on OpenWebText](#training-on-openwebtext) and docs/09).
 
 ## Training on OpenWebText
 
@@ -149,6 +258,15 @@ A bigger model on a GPU gets much further. Try
 
 If you run out of GPU memory, lower `--batch_size` first, then `--block_size`.
 
+The v2 pipeline for the same data is faster and gives much better results:
+
+```bash
+python -m llm.prepare --input data/output_train.txt --val_input data/output_val.txt \
+    --out_dir data/owt_bpe --vocab_size 16384 --tokenizer_sample_mb 50 --workers 8
+python -m llm.train --data_dir data/owt_bpe --out_dir runs/owt --preset gpt-small \
+    --batch_size 16 --grad_accum 8 --max_iters 20000 --lr 6e-4 --warmup_iters 2000 --compile
+```
+
 ## Script reference
 
 `python scripts/training.py --help`
@@ -170,7 +288,8 @@ If you run out of GPU memory, lower `--batch_size` first, then `--block_size`.
 
 ## Notes
 
-* Checkpoints are pickled as `{'model', 'tokenizer'}`. Only load pickles you trust.
+* v1 checkpoints are pickled as `{'model', 'tokenizer'}`, so only load pickles you trust.
+  v2 checkpoints hold only tensors and plain data and load with `weights_only=True`.
 * The blocks use pre-norm (LayerNorm before attention and before the feed-forward
   layer), as in GPT-2. Post-norm, as in the original Transformer, is described in
   docs/04.
