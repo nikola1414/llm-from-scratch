@@ -14,7 +14,7 @@ data/vocab.txt
 
 # v2 prepared datasets and training runs
 runs/
-data/oz_bpe/
+data/oz_bpe*/
 data/oz_char/
 data/owt_bpe/
 .pytest_cache/
