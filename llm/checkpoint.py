@@ -14,7 +14,8 @@ def save_checkpoint(path, model, tokenizer, optimizer=None, **extra):
         **extra,
     }
     if optimizer is not None:
-        ckpt["optimizer"] = optimizer.state_dict()
+        opts = optimizer if isinstance(optimizer, (list, tuple)) else [optimizer]
+        ckpt["optimizer"] = [o.state_dict() for o in opts]
     torch.save(ckpt, path)
 
 

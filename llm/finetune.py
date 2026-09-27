@@ -95,7 +95,7 @@ def main(argv=None):
     print(f"{len(train)} train / {len(val)} val examples, device {device}")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    optimizer = model.configure_optimizer(args.weight_decay, args.lr, (0.9, 0.99), device.split(":")[0])
+    optimizers = model.configure_optimizer(args.weight_decay, args.lr, (0.9, 0.99), device.split(":")[0])
     pad_id = tokenizer.special_tokens[EOT]
     steps_per_epoch = (len(train) + args.batch_size - 1) // args.batch_size
     total_steps = steps_per_epoch * args.epochs
@@ -103,15 +103,18 @@ def main(argv=None):
     for epoch in range(args.epochs):
         random.shuffle(train)
         for i in range(0, len(train), args.batch_size):
-            for group in optimizer.param_groups:
-                group["lr"] = cosine_lr(step, args.lr, args.lr / 10, min(20, total_steps // 10), total_steps)
+            lr = cosine_lr(step, args.lr, args.lr / 10, min(20, total_steps // 10), total_steps)
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = lr
             x, y = collate(train[i:i + args.batch_size], pad_id, device)
             with ctx:
                 _, loss = model(x, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            for opt in optimizers:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
             step += 1
         train_loss = eval_loss(model, train, args, pad_id, device, ctx)
         val_loss = eval_loss(model, val, args, pad_id, device, ctx) if val else train_loss
