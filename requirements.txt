@@ -8,3 +8,5 @@ matplotlib
 # Data extraction (OpenWebText ships as .xz archives; Python's built-in `lzma`
 # handles them. `pylzma` is optional and needs C build tools, see docs/00_setup.md)
 tqdm
+# Tests
+pytest
