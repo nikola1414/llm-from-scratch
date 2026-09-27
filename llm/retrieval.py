@@ -115,7 +115,7 @@ def main():
     b = sub.add_parser("build")
     b.add_argument("--books", default="data/corpus/books", help="folder of .txt files")
     b.add_argument("--out", default="data/corpus/index.json")
-    b.add_argument("--max_chars", type=int, default=500)
+    b.add_argument("--max_chars", type=int, default=400, help="passage size (400 = what corpus-chat was trained on)")
     s = sub.add_parser("search")
     s.add_argument("--index", default="data/corpus/index.json")
     s.add_argument("-k", type=int, default=3)
