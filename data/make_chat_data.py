@@ -53,11 +53,12 @@ def find_entities(texts, min_count=25):
 
 
 def answer_sentence(chunk, entity):
-    for s in SENT.split(chunk):
-        s = s.strip()
-        if entity in s and not s.startswith('"') and '"' not in s and 30 <= len(s) <= 220:
-            return s
-    return None
+    """The first narrative sentence about `entity`; if there is none, the first sentence
+    of dialogue about it (retrieved passages often mention a character only in speech)."""
+    sentences = [s.strip() for s in SENT.split(chunk)]
+    about = [s for s in sentences if entity in s and 30 <= len(s) <= 220]
+    narrative = [s for s in about if '"' not in s and "'" not in s[:1]]
+    return (narrative or about or [None])[0]
 
 
 def main():
@@ -100,7 +101,7 @@ def main():
         if rejected != ans:
             pairs.append({"prompt": prompt, "chosen": ans, "rejected": rejected})
     # unanswerable: unrelated passage
-    for _ in range(args.n // 12):
+    for _ in range(args.n // 25):
         ci, e, _ = rng.choice(candidates)
         other = rng.randrange(len(index.chunks))
         if e in index.chunks[other]:
