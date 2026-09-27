@@ -3,12 +3,21 @@
 Upgrades over v1 (`scripts/gpt.py`), each switchable in `GPTConfig` for ablations:
 
 * **RoPE** rotary position embeddings instead of a learned position table
-  (`pos_emb='rope'|'learned'`) — relative positions, no extra parameters.
+  (`pos_emb='rope'|'learned'`) — relative positions, no extra parameters. Can be
+  stretched to longer contexts after training (`extend_context`, linear or NTK scaling).
 * **RMSNorm** instead of LayerNorm (`norm='rms'|'layer'`).
-* **SwiGLU** feed-forward instead of ReLU (`mlp='swiglu'|'gelu'|'relu'`).
+* **SwiGLU** feed-forward instead of ReLU (`mlp='swiglu'|'gelu'|'relu'`), optionally a
+  **mixture of experts** (`n_experts`, `moe_top_k`).
 * **Grouped-query attention** (`n_kv_head < n_head`) — fewer K/V heads, smaller KV cache.
 * **Fused attention**: one QKV projection and `F.scaled_dot_product_attention`
   (FlashAttention kernels on GPU) instead of a Python loop over heads.
+* **QK-norm** (`qk_norm`): RMS-normalise queries and keys per head, which keeps attention
+  logits bounded and allows higher learning rates (OLMo 2, Gemma 3).
+* **Logit soft-capping** (`logit_softcap`): cap·tanh(logits/cap) (Gemma 2).
+* **Value residual** (`value_residual`): every layer mixes in the first layer's values
+  (ResFormer), easing information flow in deep stacks.
+* **U-Net skips** (`unet_skips`): the second half of the layers receives learned-weight
+  skip connections from the mirrored layers of the first half (modded-nanoGPT).
 * **Weight tying** between the token embedding and the output layer.
 * **Scaled residual init**: output projections use std 0.02/sqrt(2·n_layer) (GPT-2).
 * **KV cache** for fast generation, plus temperature / top-k / top-p / repetition penalty.
@@ -19,7 +28,6 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
 
 @dataclass
 class GPTConfig:
@@ -36,6 +44,15 @@ class GPTConfig:
     mlp: str = "swiglu"            # 'swiglu' | 'gelu' | 'relu'
     tie_weights: bool = True
     rope_theta: float = 10000.0
+    rope_scaling: str = None       # None | 'linear' | 'ntk'  (set by extend_context)
+    rope_factor: float = 1.0
+    qk_norm: bool = False
+    logit_softcap: float = 0.0     # 0 = off
+    value_residual: bool = False
+    unet_skips: bool = False
+    n_experts: int = 0             # 0 = dense MLP
+    moe_top_k: int = 2
+    moe_aux_coef: float = 0.01
 
     def __post_init__(self):
         if self.n_kv_head is None:
@@ -44,6 +61,8 @@ class GPTConfig:
         assert self.n_head % self.n_kv_head == 0, "n_head must be divisible by n_kv_head"
         if self.pos_emb == "rope":
             assert (self.n_embd // self.n_head) % 2 == 0, "RoPE needs an even head size"
+        if self.n_experts:
+            assert 1 <= self.moe_top_k <= self.n_experts
 
     def to_dict(self):
         return asdict(self)
@@ -68,10 +87,20 @@ def make_norm(config):
     return nn.LayerNorm(config.n_embd, bias=config.bias)
 
 
-def rope_cache(seq_len, head_dim, theta, device=None):
-    """cos/sin tables of shape (seq_len, head_dim/2) for rotary embeddings."""
+def rope_cache(seq_len, head_dim, theta, device=None, scaling=None, factor=1.0):
+    """cos/sin tables of shape (seq_len, head_dim/2) for rotary embeddings.
+
+    scaling='linear' (position interpolation): positions are divided by `factor`, so a
+    longer sequence is squeezed into the angle range seen in training.
+    scaling='ntk' (NTK-aware): the base theta is enlarged instead, which interpolates the
+    low frequencies (long range) while keeping the high frequencies (local detail) intact.
+    """
+    if scaling == "ntk" and factor != 1.0:
+        theta = theta * factor ** (head_dim / (head_dim - 2))
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     t = torch.arange(seq_len, device=device).float()
+    if scaling == "linear":
+        t = t / factor
     freqs = torch.outer(t, inv_freq)
     return freqs.cos(), freqs.sin()
 
@@ -89,7 +118,7 @@ def apply_rope(x, cos, sin):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=0):
         super().__init__()
         self.n_head, self.n_kv_head = config.n_head, config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
@@ -98,16 +127,26 @@ class CausalSelfAttention(nn.Module):
         self.proj.RESIDUAL_SCALE = True
         self.dropout = config.dropout
         self.resid_dropout = nn.Dropout(config.dropout)
+        if config.qk_norm:
+            self.q_norm, self.k_norm = RMSNorm(self.head_dim), RMSNorm(self.head_dim)
+        self.mix_values = config.value_residual and layer_idx > 0
+        if self.mix_values:
+            self.value_lambda = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, x, rope=None, kv_cache=None):
+    def forward(self, x, rope=None, kv_cache=None, v_first=None):
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(
             [self.n_head * self.head_dim, self.n_kv_head * self.head_dim, self.n_kv_head * self.head_dim], dim=-1)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)       # (B, H, T, D)
         k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)    # (B, KV, T, D)
         v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        if hasattr(self, "q_norm"):
+            q, k = self.q_norm(q), self.k_norm(k)
         if rope is not None:
             q, k = apply_rope(q, *rope), apply_rope(k, *rope)
+        v_this = v                                                         # first layer's values, pre-mixing
+        if self.mix_values and v_first is not None:
+            v = self.value_lambda * v + (1 - self.value_lambda) * v_first
 
         past = 0
         if kv_cache is not None:
@@ -129,7 +168,7 @@ class CausalSelfAttention(nn.Module):
             q, k, v, is_causal=(past == 0 and T > 1),
             dropout_p=self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.proj(y))
+        return self.resid_dropout(self.proj(y)), v_this
 
 
 class MLP(nn.Module):
@@ -158,18 +197,51 @@ class MLP(nn.Module):
         return self.dropout(self.down(h))
 
 
-class Block(nn.Module):
+class MoE(nn.Module):
+    """Sparse mixture of experts: a router picks `top_k` of `n_experts` MLPs per token.
+
+    Total parameters grow with the number of experts while compute per token grows only
+    with top_k. A Switch-Transformer load-balancing loss (stored in `aux_loss`) keeps the
+    router from sending every token to the same expert.
+    """
+
     def __init__(self, config):
         super().__init__()
-        self.norm1 = make_norm(config)
-        self.attn = CausalSelfAttention(config)
-        self.norm2 = make_norm(config)
-        self.mlp = MLP(config)
+        self.n_experts, self.top_k = config.n_experts, config.moe_top_k
+        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_experts)])
+        self.aux_loss = torch.tensor(0.0)
 
-    def forward(self, x, rope=None, kv_cache=None):
-        x = x + self.attn(self.norm1(x), rope, kv_cache)
+    def forward(self, x):
+        B, T, C = x.shape
+        flat = x.reshape(-1, C)
+        probs = F.softmax(self.router(flat).float(), dim=-1)              # (N, E)
+        weights, chosen = probs.topk(self.top_k, dim=-1)                   # (N, k)
+        weights = (weights / weights.sum(-1, keepdim=True)).type_as(x)
+        out = torch.zeros_like(flat)
+        for e, expert in enumerate(self.experts):
+            token_idx, slot = (chosen == e).nonzero(as_tuple=True)
+            if token_idx.numel():
+                out.index_add_(0, token_idx, expert(flat[token_idx]) * weights[token_idx, slot, None])
+        # fraction of routing slots per expert x mean router probability per expert
+        frac = F.one_hot(chosen, self.n_experts).float().sum(1).mean(0) / self.top_k
+        self.aux_loss = self.n_experts * (frac * probs.mean(0)).sum()
+        return out.view(B, T, C)
+
+
+class Block(nn.Module):
+    def __init__(self, config, layer_idx=0):
+        super().__init__()
+        self.norm1 = make_norm(config)
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.norm2 = make_norm(config)
+        self.mlp = MoE(config) if config.n_experts else MLP(config)
+
+    def forward(self, x, rope=None, kv_cache=None, v_first=None):
+        a, v = self.attn(self.norm1(x), rope, kv_cache, v_first)
+        x = x + a
         x = x + self.mlp(self.norm2(x))
-        return x
+        return x, v
 
 
 class GPT(nn.Module):
@@ -179,16 +251,35 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.pos_emb = nn.Embedding(config.block_size, config.n_embd) if config.pos_emb == "learned" else None
         self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([Block(config, i) for i in range(config.n_layer)])
+        if config.unet_skips:
+            self.skip_weights = nn.Parameter(torch.ones(config.n_layer // 2))
         self.norm_f = make_norm(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         if config.tie_weights:
             self.lm_head.weight = self.tok_emb.weight
         if config.pos_emb == "rope":
-            cos, sin = rope_cache(config.block_size, config.n_embd // config.n_head, config.rope_theta)
-            self.register_buffer("rope_cos", cos, persistent=False)
-            self.register_buffer("rope_sin", sin, persistent=False)
+            self._build_rope()
         self.apply(self._init_weights)
+
+    def _build_rope(self):
+        c = self.config
+        cos, sin = rope_cache(c.block_size, c.n_embd // c.n_head, c.rope_theta,
+                              device=self.tok_emb.weight.device, scaling=c.rope_scaling, factor=c.rope_factor)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
+
+    def extend_context(self, block_size, scaling="ntk"):
+        """Use the model with a longer context than it was trained on (RoPE only).
+        scaling: 'ntk' | 'linear' | None (plain extrapolation, usually degrades)."""
+        assert self.config.pos_emb == "rope", "a learned position table cannot be extended"
+        trained = self.config.block_size if self.config.rope_scaling is None else \
+            int(self.config.block_size / self.config.rope_factor)
+        self.config.rope_factor = block_size / trained if scaling else 1.0
+        self.config.rope_scaling = scaling
+        self.config.block_size = block_size
+        self._build_rope()
+        return self
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -214,8 +305,8 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, kv_caches=None, start_pos=0):
         """idx (B, T) -> logits (B, T, V). With `targets`, also returns the mean
         cross-entropy (positions whose target is -1 are ignored, e.g. padded or prompt
-        tokens during finetuning). Without targets only the last position's logits are
-        computed, which is all generation needs."""
+        tokens during finetuning) plus the MoE load-balancing loss. Without targets only
+        the last position's logits are computed, which is all generation needs."""
         B, T = idx.shape
         assert start_pos + T <= self.config.block_size, \
             f"sequence of length {start_pos + T} exceeds block_size {self.config.block_size}"
@@ -226,25 +317,60 @@ class GPT(nn.Module):
         else:
             rope = (self.rope_cos[start_pos:start_pos + T], self.rope_sin[start_pos:start_pos + T])
         x = self.drop(x)
+        v_first, skips, half = None, [], self.config.n_layer // 2
         for i, block in enumerate(self.blocks):
-            x = block(x, rope, kv_caches[i] if kv_caches is not None else None)
+            if self.config.unet_skips and i >= self.config.n_layer - half:
+                x = x + self.skip_weights[self.config.n_layer - 1 - i] * skips.pop()
+            x, v = block(x, rope, kv_caches[i] if kv_caches is not None else None, v_first)
+            if i == 0:
+                v_first = v
+            if self.config.unet_skips and i < half:
+                skips.append(x)
         x = self.norm_f(x)
 
         if targets is None:
-            return self.lm_head(x[:, [-1], :]), None
-        logits = self.lm_head(x)
+            return self._logits(x[:, [-1], :]), None
+        logits = self._logits(x)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)).float(), targets.reshape(-1), ignore_index=-1)
+        if self.config.n_experts and self.training:
+            loss = loss + self.config.moe_aux_coef * sum(b.mlp.aux_loss for b in self.blocks)
         return logits, loss
 
-    def configure_optimizer(self, weight_decay, learning_rate, betas=(0.9, 0.95), device_type="cpu"):
-        """AdamW with weight decay only on matrices (not on norms/biases)."""
-        params = [p for p in self.parameters() if p.requires_grad]
-        decay = [p for p in params if p.dim() >= 2]
-        no_decay = [p for p in params if p.dim() < 2]
-        groups = [{"params": decay, "weight_decay": weight_decay},
-                  {"params": no_decay, "weight_decay": 0.0}]
+    def _logits(self, x):
+        logits = self.lm_head(x)
+        if self.config.logit_softcap:
+            cap = self.config.logit_softcap
+            logits = cap * torch.tanh(logits / cap)
+        return logits
+
+    def configure_optimizer(self, weight_decay, learning_rate, betas=(0.9, 0.95), device_type="cpu",
+                            optimizer="adamw", muon_lr=0.02, muon_momentum=0.95):
+        """Returns a list of optimizers.
+
+        adamw: AdamW with weight decay only on matrices (not on norms/biases/scalars).
+        muon:  Muon for the 2-D hidden matrices inside the blocks (attention and MLP
+               weights), AdamW for everything else (embeddings/output, norms, router).
+        Each param group remembers its base lr in `base_lr` for the schedule.
+        """
         extra = {"fused": True} if device_type == "cuda" else {}
-        return torch.optim.AdamW(groups, lr=learning_rate, betas=betas, **extra)
+        params = {n: p for n, p in self.named_parameters() if p.requires_grad}
+        if optimizer == "muon":
+            from .optim import Muon
+            muon = [p for n, p in params.items() if p.dim() == 2 and n.startswith("blocks.") and "router" not in n]
+            muon_ids = {id(p) for p in muon}
+            rest = [p for p in params.values() if id(p) not in muon_ids]
+            adam_groups = [{"params": [p for p in rest if p.dim() >= 2], "weight_decay": weight_decay},
+                           {"params": [p for p in rest if p.dim() < 2], "weight_decay": 0.0}]
+            opts = [torch.optim.AdamW(adam_groups, lr=learning_rate, betas=betas, **extra),
+                    Muon(muon, lr=muon_lr, momentum=muon_momentum, weight_decay=weight_decay)]
+        else:
+            groups = [{"params": [p for p in params.values() if p.dim() >= 2], "weight_decay": weight_decay},
+                      {"params": [p for p in params.values() if p.dim() < 2], "weight_decay": 0.0}]
+            opts = [torch.optim.AdamW(groups, lr=learning_rate, betas=betas, **extra)]
+        for opt in opts:
+            for g in opt.param_groups:
+                g["base_lr"] = g["lr"]
+        return opts
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None,
