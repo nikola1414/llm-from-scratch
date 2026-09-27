@@ -109,3 +109,31 @@ def test_permute_is_a_permutation():
     p = export.permute_for_llama_cpp(w, 2)
     assert sorted(p.flatten().tolist()) == sorted(w.flatten().tolist())
     assert not torch.equal(p, w)
+
+
+def test_download_hf_with_fake_datasets(tmp_path, monkeypatch):
+    """The HF downloader, with the `datasets` library replaced by a fake."""
+    import importlib.util
+    import sys
+    import types
+    rows = {("HuggingFaceFW/fineweb-edu", "train"): [{"text": f"doc {i}"} for i in range(10)],
+            ("roneneldan/TinyStories", "train"): [{"text": "Once upon a time."}] * 3,
+            ("roneneldan/TinyStories", "validation"): [{"text": "The end."}],
+            ("databricks/databricks-dolly-15k", "train"): [
+                {"instruction": "Say hi", "context": "", "response": "Hi"},
+                {"instruction": "Who?", "context": "Ozma rules.", "response": "Ozma"}]}
+    fake = types.ModuleType("datasets")
+    fake.load_dataset = lambda path, name=None, split=None, streaming=False, **kw: rows[(path, split)]
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+    spec = importlib.util.spec_from_file_location("download_hf", "data/download_hf.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for argv in (["fineweb", "--out", str(tmp_path / "fw"), "--val_every", "5"],
+                 ["tinystories", "--out", str(tmp_path / "ts")],
+                 ["dolly", "--out", str(tmp_path / "dolly.jsonl")]):
+        monkeypatch.setattr(sys, "argv", ["x"] + argv)
+        mod.main()
+    assert (tmp_path / "fw" / "val.txt").read_text().count("<|endoftext|>") == 2
+    assert (tmp_path / "ts" / "train.txt").read_text().count("Once upon") == 3
+    dolly = [json.loads(line) for line in (tmp_path / "dolly.jsonl").read_text().splitlines()]
+    assert {"prompt": "Context: Ozma rules.\n\nQuestion: Who?", "response": "Ozma"} in dolly
