@@ -31,6 +31,10 @@ def main():
     p.add_argument("--vocab_size", type=int, default=2048)
     p.add_argument("--tokenizer_sample_mb", type=float, default=100, help="train BPE on the first N MB")
     p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--bpe_dropout", type=float, default=0.0,
+                   help="BPE-dropout rate for the training split (regularisation for small corpora)")
+    p.add_argument("--dropout_copies", type=int, default=4,
+                   help="with --bpe_dropout: number of differently-segmented copies of the train split")
     args = p.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -49,7 +53,8 @@ def main():
             if budget <= 0:
                 break
         sample = "".join(sample)
-        train_texts, val_texts = iter_text_chunks(args.input), iter_text_chunks(args.val_input)
+        train_texts = lambda: iter_text_chunks(args.input)  # noqa: E731 (re-iterable)
+        val_texts = iter_text_chunks(args.val_input)
 
     t0 = time.time()
     if args.tokenizer == "bpe":
@@ -57,7 +62,7 @@ def main():
     else:
         chars = set(sample)
         if not small:
-            for chunk in iter_text_chunks(args.input):
+            for chunk in train_texts():
                 chars.update(chunk)
             for chunk in iter_text_chunks(args.val_input):
                 chars.update(chunk)
@@ -70,7 +75,17 @@ def main():
     meta = {"vocab_size": tok.vocab_size, "dtype": token_dtype(tok.vocab_size).__name__, "tokenizer": args.tokenizer}
     for split, texts in [("train", train_texts), ("val", val_texts)]:
         t0 = time.time()
-        n_tok, n_chr = write_tokens(texts, os.path.join(args.out_dir, f"{split}.bin"), tok, args.workers)
+        out = os.path.join(args.out_dir, f"{split}.bin")
+        if split == "train" and args.bpe_dropout and args.tokenizer == "bpe":
+            n_tok = n_chr = 0
+            for copy in range(args.dropout_copies):
+                it = texts() if callable(texts) else iter(texts)
+                t, c = write_tokens(it, out, tok, args.workers, args.bpe_dropout, seed=copy, append=copy > 0)
+                n_tok, n_chr = n_tok + t, n_chr + c
+            meta["train_copies"], meta["bpe_dropout"] = args.dropout_copies, args.bpe_dropout
+        else:
+            texts = texts() if callable(texts) else texts
+            n_tok, n_chr = write_tokens(texts, out, tok, args.workers)
         meta[f"{split}_tokens"], meta[f"{split}_chars"] = n_tok, n_chr
         print(f"{split}: {n_chr:,} chars -> {n_tok:,} tokens ({n_chr / max(n_tok, 1):.2f} chars/token, {time.time() - t0:.1f}s)")
     with open(os.path.join(args.out_dir, "meta.json"), "w", encoding="utf-8") as f:

@@ -53,3 +53,31 @@ def test_char_tokenizer():
     assert tok.decode(tok.encode("a cab")) == "a cab"
     assert tok.encode("xyz") == []            # unknown characters are dropped
     assert tok.decode(tok.encode("a<|endoftext|>")) == "a<|endoftext|>"
+
+
+def test_gpt2_pattern_is_unicode_aware():
+    tok = BPETokenizer.train("héllo wörld " * 50, 300, pattern="gpt2")
+    assert tok.pattern == "gpt2"
+    assert tok.split.findall(" wörld") == [" wörld"]          # one chunk, not split at ö
+    s = "Ünïcode wörds 12345"
+    assert tok.decode(tok.encode(s)) == s
+
+
+def test_bpe_dropout_is_lossless_and_stochastic(bpe):
+    a = bpe.encode_with_dropout(TEXT, 0.3, seed=1)
+    b = bpe.encode_with_dropout(TEXT, 0.3, seed=2)
+    assert bpe.decode(a) == TEXT and bpe.decode(b) == TEXT
+    assert a != b                                   # different segmentations
+    assert len(a) > len(bpe.encode(TEXT))           # dropout -> fewer merges -> more tokens
+    assert bpe.encode_with_dropout(TEXT, 0.0, seed=1) == bpe.encode(TEXT)
+
+
+def test_old_tokenizer_json_defaults_to_ascii_pattern(bpe):
+    d = bpe.to_dict()
+    d.pop("pattern")
+    assert Tokenizer.from_dict(d).pattern == "ascii"
+
+
+def test_special_tokens_not_learned_as_merges():
+    tok = BPETokenizer.train("a<|endoftext|>b " * 200, 300)
+    assert all(b"<|" not in tok.vocab[i] for i in range(256, 256 + len(tok.merges)))

@@ -16,17 +16,25 @@ def token_dtype(vocab_size):
     return np.uint16 if vocab_size < 2 ** 16 else np.uint32
 
 
-_worker_tok = None
+_worker = {}
 
 
-def _init_worker(tok_dict):
-    global _worker_tok
+def _init_worker(tok_dict, dropout):
     from .tokenizer import Tokenizer
-    _worker_tok = Tokenizer.from_dict(tok_dict)
+    _worker["tok"], _worker["dropout"] = Tokenizer.from_dict(tok_dict), dropout
 
 
-def _encode_worker(text):
-    return _worker_tok.encode(text, allowed_special=False)
+def _encode_worker(item):
+    seed, text = item
+    return encode_text(_worker["tok"], text, _worker["dropout"], seed)
+
+
+def encode_text(tokenizer, text, dropout=0.0, seed=None):
+    """Special tokens written in the corpus (e.g. <|endoftext|> between documents) become
+    their ids; with dropout > 0 BPE segmentation is randomised (training augmentation)."""
+    if dropout:
+        return tokenizer.encode_with_dropout(text, dropout, seed)
+    return tokenizer.encode(text)
 
 
 def iter_text_chunks(path, chunk_chars=1 << 20):
@@ -49,23 +57,23 @@ def iter_text_chunks(path, chunk_chars=1 << 20):
             yield block[:cut + 1]
 
 
-def write_tokens(texts, out_path, tokenizer, workers=1):
+def write_tokens(texts, out_path, tokenizer, workers=1, dropout=0.0, seed=0, append=False):
     """Tokenize an iterable of strings into a flat binary file; returns (#tokens, #chars)."""
     dtype = token_dtype(tokenizer.vocab_size)
     counts = {"tokens": 0, "chars": 0}
 
     def counted(it):  # count characters as the texts stream past (works with Pool.imap)
-        for t in it:
+        for i, t in enumerate(it):
             counts["chars"] += len(t)
-            yield t
+            yield seed * 1_000_003 + i, t
 
     pool = None
     if workers > 1:
-        pool = Pool(workers, initializer=_init_worker, initargs=(tokenizer.to_dict(),))
+        pool = Pool(workers, initializer=_init_worker, initargs=(tokenizer.to_dict(), dropout))
         results = pool.imap(_encode_worker, counted(texts), chunksize=1)
     else:
-        results = (tokenizer.encode(t, allowed_special=False) for t in counted(texts))
-    with open(out_path, "wb") as f:
+        results = (encode_text(tokenizer, t, dropout, sd) for sd, t in counted(texts))
+    with open(out_path, "ab" if append else "wb") as f:
         for ids in results:
             np.asarray(ids, dtype=dtype).tofile(f)
             counts["tokens"] += len(ids)

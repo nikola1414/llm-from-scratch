@@ -11,16 +11,39 @@ never split and can be used to build chat templates, and both serialise to plain
 """
 import heapq
 import json
+import random
 import re
 from collections import Counter, defaultdict
 
-# GPT-2 style pre-tokenization: contractions, words with their leading space, numbers
-# (at most 3 digits), punctuation runs and whitespace. Merges never cross these chunks,
-# so tokens don't glue words to punctuation. Non-ASCII letters fall in the "other" class,
-# which is fine because the tokenizer works on bytes.
-SPLIT_PATTERN = re.compile(
-    r"""'(?:s|t|re|ve|m|ll|d)| ?[A-Za-z]+| ?[0-9]{1,3}| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+"""
-)
+try:
+    import regex  # supports Unicode classes like \p{L}
+except ImportError:  # pragma: no cover
+    regex = None
+
+# Pre-tokenization: text is split into chunks (contractions, words with their leading
+# space, numbers, punctuation runs, whitespace) and merges never cross chunk boundaries,
+# so tokens don't glue words to punctuation.
+#   "gpt2"  — the exact GPT-2 pattern (Unicode-aware; needs the `regex` package). It is
+#             what llama.cpp calls the "gpt-2" pre-tokenizer, so exported models tokenize
+#             identically there.
+#   "ascii" — a dependency-free approximation (ASCII letters, numbers of at most 3
+#             digits); used by the first v2 checkpoints.
+SPLIT_PATTERNS = {
+    "gpt2": r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""",
+    "ascii": r"""'(?:s|t|re|ve|m|ll|d)| ?[A-Za-z]+| ?[0-9]{1,3}| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+""",
+}
+DEFAULT_PATTERN = "gpt2" if regex is not None else "ascii"
+
+
+def compile_pattern(name):
+    if name == "gpt2":
+        if regex is None:
+            raise ImportError("the 'gpt2' split pattern needs `pip install regex`")
+        return regex.compile(SPLIT_PATTERNS[name])
+    return re.compile(SPLIT_PATTERNS[name])
+
+
+SPLIT_PATTERN = compile_pattern("ascii")  # kept for backwards compatibility
 
 DEFAULT_SPECIAL_TOKENS = ["<|endoftext|>", "<|user|>", "<|assistant|>"]
 
@@ -101,8 +124,10 @@ class CharTokenizer(Tokenizer):
 
 
 class BPETokenizer(Tokenizer):
-    def __init__(self, merges=None, special_tokens=DEFAULT_SPECIAL_TOKENS):
+    def __init__(self, merges=None, special_tokens=DEFAULT_SPECIAL_TOKENS, pattern="ascii"):
         # merges: list of (left_id, right_id); merge i creates token id 256 + i
+        self.pattern = pattern
+        self.split = compile_pattern(pattern)
         self.merges = [tuple(m) for m in (merges or [])]
         self.ranks = {pair: i for i, pair in enumerate(self.merges)}
         self.vocab = {i: bytes([i]) for i in range(256)}
@@ -119,13 +144,16 @@ class BPETokenizer(Tokenizer):
 
     # ------------------------------------------------------------------ training
     @classmethod
-    def train(cls, text, vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS, verbose=False):
+    def train(cls, text, vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS, verbose=False, pattern=None):
         """Learn `vocab_size - 256 - len(special_tokens)` merges from `text`."""
+        pattern = pattern or DEFAULT_PATTERN
         num_merges = vocab_size - 256 - len(special_tokens)
         assert num_merges >= 0, "vocab_size must be at least 256 + number of special tokens"
+        for s in special_tokens:  # special markers are never part of the learned merges
+            text = text.replace(s, " ")
 
         # distinct chunks with their frequencies — merging works on these, not raw text
-        chunk_counts = Counter(SPLIT_PATTERN.findall(text))
+        chunk_counts = Counter(compile_pattern(pattern).findall(text))
         words = [list(chunk.encode("utf-8")) for chunk in chunk_counts]
         freqs = list(chunk_counts.values())
 
@@ -174,17 +202,25 @@ class BPETokenizer(Tokenizer):
             where.pop(pair, None)
             if verbose and len(merges) % 500 == 0:
                 print(f"  merge {len(merges)}/{num_merges}")
-        return cls(merges, special_tokens)
+        return cls(merges, special_tokens, pattern)
 
     # ------------------------------------------------------------------ encoding
-    def _encode_chunk(self, chunk):
-        cached = self._cache.get(chunk)
-        if cached is not None:
-            return cached
+    def _encode_chunk(self, chunk, dropout=0.0, rng=None):
+        if not dropout:
+            cached = self._cache.get(chunk)
+            if cached is not None:
+                return cached
         ids = list(chunk.encode("utf-8"))
         while len(ids) >= 2:
             # merge the pair that was learned earliest (lowest rank), exactly as in training
-            pair = min(zip(ids, ids[1:]), key=lambda p: self.ranks.get(p, float("inf")))
+            candidates = zip(ids, ids[1:])
+            if dropout:
+                # BPE-dropout (Provilkov et al. 2020): each possible merge is skipped with
+                # probability `dropout`, so the same word gets different segmentations
+                candidates = [p for p in candidates if p in self.ranks and rng.random() >= dropout]
+                if not candidates:
+                    break
+            pair = min(candidates, key=lambda p: self.ranks.get(p, float("inf")))
             rank = self.ranks.get(pair)
             if rank is None:
                 break
@@ -197,14 +233,22 @@ class BPETokenizer(Tokenizer):
                     merged.append(ids[i])
                     i += 1
             ids = merged
-        if len(self._cache) < 500_000:
+        if not dropout and len(self._cache) < 500_000:
             self._cache[chunk] = ids
         return ids
 
-    def _encode_ordinary(self, text):
+    def _encode_ordinary(self, text, dropout=0.0, rng=None):
         ids = []
-        for chunk in SPLIT_PATTERN.findall(text):
-            ids.extend(self._encode_chunk(chunk))
+        for chunk in self.split.findall(text):
+            ids.extend(self._encode_chunk(chunk, dropout, rng))
+        return ids
+
+    def encode_with_dropout(self, text, dropout, seed=None, allowed_special=True):
+        """Stochastic segmentation for training-time augmentation (see _encode_chunk)."""
+        rng = random.Random(seed)
+        ids = []
+        for is_special, piece in self._split_special(text, allowed_special):
+            ids.extend([self.special_tokens[piece]] if is_special else self._encode_ordinary(piece, dropout, rng))
         return ids
 
     def decode_bytes(self, ids):
@@ -221,8 +265,8 @@ class BPETokenizer(Tokenizer):
 
     def to_dict(self):
         return {"type": "bpe", "merges": [list(m) for m in self.merges],
-                "special_tokens": list(self.special_tokens)}
+                "special_tokens": list(self.special_tokens), "pattern": self.pattern}
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["merges"], d["special_tokens"])
+        return cls(d["merges"], d["special_tokens"], d.get("pattern", "ascii"))

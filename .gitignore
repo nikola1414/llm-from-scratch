@@ -19,3 +19,5 @@ data/oz_char/
 data/owt_bpe/
 .pytest_cache/
 !models/*.pt
+data/corpus/
+data/corpus_*/

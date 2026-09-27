@@ -16,6 +16,6 @@ jobs:
       - name: Install CPU PyTorch and test deps
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy pytest
+          pip install numpy pytest regex
       - name: Run tests
         run: python -m pytest -q

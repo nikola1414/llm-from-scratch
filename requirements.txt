@@ -1,6 +1,7 @@
 # Core
 torch>=2.0
 numpy
+regex        # Unicode-aware GPT-2 pre-tokenization
 # Notebooks
 jupyter
 ipykernel
