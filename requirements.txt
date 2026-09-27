@@ -11,3 +11,9 @@ matplotlib
 tqdm
 # Tests
 pytest
+# Optional extras
+gradio        # python -m llm.webui
+transformers  # verify Hugging Face exports
+tokenizers    # python -m llm.export --format hf
+safetensors   # python -m llm.export --format hf
+gguf          # python -m llm.export --format gguf

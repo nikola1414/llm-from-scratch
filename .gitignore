@@ -21,3 +21,5 @@ data/owt_bpe/
 !models/*.pt
 data/corpus/
 data/corpus_*/
+data/chat/
+export/
