@@ -106,3 +106,19 @@ remember**:
 
 `data/download_hf.py` also fetches TinyStories, which gives fluent small models very
 quickly.
+
+## Results
+
+The full tables are in `experiments/results_round3.md`. In short:
+
+* **Data** was the biggest lever. The same 1.3M-parameter recipe goes from 2.03 bits/char
+  on one book to 1.59 on 18 books, and the shipped 3.4M-parameter model reaches 1.415.
+* **MoE** (−2.3%) and **Muon** (−1.1%) help. QK-norm with soft-cap helps a little. Value
+  residual, U-Net skips and EMA make no difference at this scale. GQA costs a little
+  quality in exchange for a smaller cache. BPE-dropout hurts once data is plentiful.
+* **RAG chat** answers 58% of held-out questions, against 19% for memorised Q&A. The
+  retrieval ceiling is 85%.
+* **DPO** with easy synthetic negatives lowered the score to 46%. Preference data has to be
+  hard, ideally the model's own mistakes, to teach anything.
+* **Context extension** without extra training costs quality: 1.38 bits/char at the
+  trained 256 tokens, 1.43 at 512 tokens with NTK scaling, 1.65 with linear scaling.

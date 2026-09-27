@@ -1,6 +1,7 @@
 # LLM from scratch
 
-A GPT language model built from first principles in Python and PyTorch, in two versions:
+A GPT language model built from first principles in Python and PyTorch. It exists in two
+versions, and v2 has been improved over two rounds:
 
 * **v1 (`notebooks/`, `scripts/`)** follows the course step by step. It starts with a
   bigram model trained on a Wizard of Oz book and ends with a character-level
@@ -16,6 +17,16 @@ A GPT language model built from first principles in Python and PyTorch, in two v
 
   On the same model size and number of steps it reaches **15% lower bits per character**
   than v1 (2.07 vs 2.43), and the tuned version reaches **2.03**. See [v2](#v2-the-improved-model).
+* **Round 3** adds:
+  - 20× more training data (18 public-domain books);
+  - the Muon optimizer, EMA, multi-GPU (DDP) and hyperparameter sweeps;
+  - QK-norm, mixture of experts and other architecture options;
+  - a **retrieval-augmented chat model** that answers questions it has never seen;
+  - int8 quantization, a web UI, and export to Hugging Face / llama.cpp / Ollama;
+  - a ready-to-run GPU pipeline for web-scale data.
+
+  The shipped base model reaches **1.415 bits/char**, and the chat model answers
+  **58%** of held-out questions, against 19% before. See [Round 3](#round-3-more-data-rag-chat-export).
 
 Everything is written by hand: the tokenizers, data loaders, attention, transformer
 blocks, training loops, checkpointing and sampling. Only `torch` is used for tensors,
@@ -42,8 +53,15 @@ python scripts/training.py --data wizard --batch_size 32 --block_size 64 \
 python scripts/chatbot.py --model_path model-01.pkl
 ```
 
-For the full dataset, see [Training on OpenWebText](#training-on-openwebtext). To chat
-with the shipped v2 model right away, run `python -m llm.generate --ckpt models/oz-chat.pt --chat`.
+For the full dataset, see [Training on OpenWebText](#training-on-openwebtext).
+
+To chat with the best shipped model in the browser (it needs the corpus for retrieval,
+about a 1-minute download):
+
+```bash
+python data/download_corpus.py && python -m llm.retrieval build
+pip install gradio && python -m llm.webui --ckpt models/corpus-chat.pt --rag   # http://127.0.0.1:7860
+```
 
 ## Repository layout
 
@@ -74,11 +92,23 @@ with the shipped v2 model right away, run `python -m llm.generate --ckpt models/
 │   ├── evaluate.py                  full-split loss / perplexity / bits per char
 │   ├── generate.py                  streaming sampling + chat
 │   └── checkpoint.py, utils.py
-├── models/                          shipped v2 checkpoints (3.5 MB each)
-│   ├── oz-base.pt                   pretrained on the book
-│   └── oz-chat.pt                   + instruction finetuned on data/oz_sft.jsonl
-├── data/oz_sft.jsonl                156 Q&A pairs about the book (with paraphrases)
-├── experiments/                     ablation script + result tables
+│   ├── optim.py                     Muon optimizer
+│   ├── retrieval.py                 BM25 search for retrieval-augmented chat
+│   ├── dpo.py                       Direct Preference Optimization
+│   ├── chat_eval.py                 held-out question answering score
+│   ├── webui.py                     Gradio chat in the browser
+│   └── export.py                    Hugging Face (Llama/Qwen3) and GGUF export
+├── models/                          shipped checkpoints
+│   ├── oz-base.pt, oz-chat.pt       round 2: one book, 0.87M params (3.5 MB)
+│   ├── corpus-base.pt               round 3: 18 books, 3.4M params (14 MB)
+│   └── corpus-chat.pt               round 3: + reading-comprehension finetuning (use with --rag)
+├── data/
+│   ├── download_corpus.py           18 public-domain books → data/corpus/
+│   ├── make_chat_data.py            grounded chat data + DPO pairs from the books
+│   ├── download_hf.py               FineWeb-Edu / TinyStories / Dolly (GPU path)
+│   ├── oz_sft.jsonl                 156 hand-written Q&A pairs
+│   └── chat_eval.jsonl              26 held-out evaluation questions
+├── experiments/                     ablations, sweeps, GPU pipeline, result tables
 ├── tests/                           pytest suite (also run by GitHub Actions)
 ├── docs/                            concept notes for each stage
 └── requirements.txt
@@ -130,6 +160,7 @@ Every topic below is covered either in a notebook (code you can run) or a doc (n
 | 38 | Pretraining vs finetuning | [docs/07_pretraining_vs_finetuning.md](docs/07_pretraining_vs_finetuning.md) |
 | 39 | R&D pointers | [docs/08_rnd_pointers.md](docs/08_rnd_pointers.md) |
 | 40 | v2: applying the R&D pointers | [llm/](llm), [08_gpt_v2](notebooks/08_gpt_v2.ipynb), [docs/09_v2_improvements.md](docs/09_v2_improvements.md) |
+| 41 | Round 3: data, Muon, RAG chat, DPO, export, GPU path | [docs/10_round3_upgrades.md](docs/10_round3_upgrades.md), [experiments/results_round3.md](experiments/results_round3.md) |
 
 ## Results (v1)
 
@@ -172,7 +203,7 @@ python -m llm.finetune --ckpt runs/oz/best.pt --data data/oz_sft.jsonl --out_dir
 python -m llm.evaluate --ckpt runs/oz/best.pt
 python -m llm.generate --ckpt runs/oz_chat/last.pt --chat
 
-python -m pytest -q    # 31 tests
+python -m pytest -q    # full test suite
 ```
 
 What changed and why is explained in [docs/09_v2_improvements.md](docs/09_v2_improvements.md).
@@ -231,6 +262,131 @@ genuinely new questions: ask "Where does Ozma live?" and you get a fluent but wr
 answer. Real assistant behaviour needs orders of magnitude more pretraining data and
 parameters. The code here scales to that (see
 [Training on OpenWebText](#training-on-openwebtext) and docs/09).
+
+## Round 3: more data, RAG chat, export
+
+The round-2 experiments showed that data, not code, was holding the model back. Round 3
+fixes that first, then adds the rest of the improvements list. Details are in
+[docs/10_round3_upgrades.md](docs/10_round3_upgrades.md) and all the numbers are in
+[experiments/results_round3.md](experiments/results_round3.md).
+
+### Use it
+
+```bash
+python data/download_corpus.py                       # 18 books, 4.8M characters
+python -m llm.retrieval build                        # BM25 index for RAG
+
+python -m llm.generate --ckpt models/corpus-base.pt --prompt "Dorothy looked at the Scarecrow and said"
+python -m llm.generate --ckpt models/corpus-chat.pt --chat --rag      # ask anything about the books
+python -m llm.webui    --ckpt models/corpus-chat.pt --rag             # same, in the browser
+python -m llm.chat_eval --ckpt models/corpus-chat.pt --rag            # 26 held-out questions
+
+python -m llm.export --ckpt models/corpus-chat.pt --format gguf --out export/corpus-chat.gguf
+cd export && ollama create oz-chat -f Modelfile && ollama run oz-chat  # or llama.cpp / LM Studio
+```
+
+Reproduce the models (about 2.5 hours on a 4-core CPU):
+
+```bash
+python -m llm.prepare --input data/corpus/train.txt --val_input data/corpus/val.txt \
+    --out_dir data/corpus_bpe4k --vocab_size 4096 --workers 4
+python -m llm.train --data_dir data/corpus_bpe4k --out_dir runs/base --n_layer 6 --n_head 6 --n_embd 192 \
+    --block_size 256 --batch_size 24 --max_iters 4000 --eval_interval 250 --lr 1e-3 --dropout 0.1 \
+    --optimizer muon --qk_norm --patience 3
+python data/make_chat_data.py
+python -m llm.finetune --ckpt runs/base/best.pt --data data/chat/sft_train.jsonl --out_dir runs/chat \
+    --epochs 6 --batch_size 16 --lr 3e-4 --dropout 0.1 --val_fraction 0.05
+```
+
+### What each change bought (4 layers / 128 dims, 2000 steps, 18-book corpus)
+
+| change | val bits/char |
+|---|---|
+| base (v2 recipe) | 1.593 |
+| mixture of experts, 4 experts / top-2 | **1.556** |
+| Muon optimizer | 1.576 |
+| QK-norm + logit soft-cap | 1.588 |
+| value residual + U-Net skips / EMA weights | 1.593 / 1.593 (no change) |
+| grouped-query attention, 2 KV heads | 1.601 |
+| BPE-dropout | 1.716 (worse: with 20× data it only costs capacity) |
+
+**Shipped `corpus-base.pt`:** 6 layers, 192 dimensions, 256-token context, Muon and
+QK-norm, trained for 4000 steps (~2 h on CPU). It reaches **1.415 bits/char**. It uses
+only options that can be exported (MoE and soft-cap can't be expressed in the Llama/Qwen3
+formats). Sample:
+
+```
+Dorothy looked at the Scarecrow and said:
+"There's a mistake, my dear."
+"I don't know," replied the Scarecrow. "I'm afraid of that!"
+"What is it?" asked the Scarecrow.
+"Don't know," answered the Scarecrow, calmly. "But we must take place for
+somewhere else. That is why we're lost."
+"And where did you happen to be here?" inquired the Tin Woodman, wonderingly.
+```
+
+### A chat model that answers new questions
+
+A few-million-parameter model can't memorise a library. So `corpus-chat.pt` was taught
+**reading comprehension** instead:
+
+1. BM25 retrieval finds the best passage.
+2. The prompt becomes `Context: … Question: …`.
+3. The model was finetuned on about 6,000 synthetic examples to answer from the passage.
+
+On 26 held-out questions that appear nowhere in its training data:
+
+| model | accuracy |
+|---|---|
+| round-2 `oz-chat.pt` (memorised Q&A) | 19% |
+| `corpus-chat.pt` without retrieval | 12% |
+| **`corpus-chat.pt` with retrieval** | **58%** (the retrieval ceiling is 85%) |
+| + DPO on synthetic preference pairs | 46% (the pairs were too easy; see the results file) |
+
+```
+> What is the Love Magnet?
+All I want is to have people love me; and as long as I own the Love Magnet everyone I meet is sure to love me dearly.
+> Who is Cap'n Bill?
+"That might o' been, Trot, that might o' been," answered Cap'n Bill.
+```
+
+It answers by quoting the most relevant sentence of the passage. Often that is the
+answer; sometimes it is only related (as for Cap'n Bill), and when retrieval picks the
+wrong passage the answer is wrong. Generating a free-form answer needs a larger model
+trained on real instruction data, which is what the GPU pipeline below does.
+
+### Also new
+
+* **Export:**
+  - `python -m llm.export --format hf` writes a model that loads in 🤗 transformers as
+    Llama (or as Qwen3 with QK-norm), with identical logits.
+  - `--format gguf` writes a file for llama.cpp, Ollama and LM Studio, plus an Ollama
+    Modelfile. Both paths are covered by tests that run the exported model and compare
+    its output.
+* **Generation options:** `--int8` (about 3× smaller), `--num_samples N`,
+  `--context 512` (RoPE NTK scaling; costs a little quality without extra training), and
+  `--chat --rag`.
+* **Training:**
+  - `torchrun --nproc_per_node N -m llm.train …` for multi-GPU;
+  - `--optimizer muon`, `--ema`;
+  - `--qk_norm --logit_softcap --value_residual --unet_skips --n_experts`;
+  - `experiments/sweep.py` for grid and random hyperparameter search.
+* **Tokenizer:** the exact GPT-2 pre-tokenizer (Unicode-aware) and BPE-dropout.
+* **Tests:** 70 tests, including a real 2-process DDP run and exported models checked
+  in transformers and llama.cpp.
+
+### GPU path
+
+`experiments/gpu_pipeline.sh` is ready to run on a CUDA machine:
+
+1. Download about 2.5B tokens of FineWeb-Edu and train a 32k BPE tokenizer.
+2. Pretrain a GPT-2-small-shaped model with Muon, EMA, QK-norm, bf16 and
+   `torch.compile`, optionally on several GPUs.
+3. Finetune on Dolly-15k plus the grounded Oz data, then run DPO.
+4. Evaluate and export to GGUF and Hugging Face.
+
+Expect roughly a day on one RTX 4090, or 2–3 hours on 8×A100. It hasn't been run here
+because no GPU was available.
 
 ## Training on OpenWebText
 
