@@ -17,3 +17,4 @@ transformers  # verify Hugging Face exports
 tokenizers    # python -m llm.export --format hf
 safetensors   # python -m llm.export --format hf
 gguf          # python -m llm.export --format gguf
+llama-cpp-python  # run / verify GGUF exports (compiles llama.cpp)

@@ -137,3 +137,26 @@ def test_download_hf_with_fake_datasets(tmp_path, monkeypatch):
     assert (tmp_path / "ts" / "train.txt").read_text().count("Once upon") == 3
     dolly = [json.loads(line) for line in (tmp_path / "dolly.jsonl").read_text().splitlines()]
     assert {"prompt": "Context: Ozma rules.\n\nQuestion: Who?", "response": "Ozma"} in dolly
+
+
+@pytest.mark.parametrize("kw", [dict(n_kv_head=1), dict(qk_norm=True)])
+def test_gguf_runs_in_llama_cpp(tmp_path, kw):
+    """Load the exported GGUF in llama.cpp and compare tokens and logits with PyTorch."""
+    llama_cpp = pytest.importorskip("llama_cpp")
+    import numpy as np
+    torch.manual_seed(0)
+    tok = BPETokenizer.train(BOOK, 330, pattern="gpt2")
+    model = GPT(GPTConfig(vocab_size=tok.vocab_size, block_size=64, n_layer=2, n_head=2, n_embd=32, dropout=0.0,
+                          **kw)).eval()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    save_checkpoint(tmp_path / "m.pt", model, tok, iter=0)
+    export.main(["--ckpt", str(tmp_path / "m.pt"), "--format", "gguf", "--out", str(tmp_path / "m.gguf")])
+    llm = llama_cpp.Llama(str(tmp_path / "m.gguf"), n_ctx=64, logits_all=True, verbose=False, n_threads=1)
+    s = "Ozma said: \"Héllo 12!\"<|endoftext|>Dorothy"
+    assert llm.tokenize(s.encode(), add_bos=False, special=True) == tok.encode(s)
+    ids = tok.encode(BOOK)[:40]
+    llm.eval(ids)
+    ours = model(torch.tensor([ids]), torch.tensor([ids]))[0][0].detach().numpy()
+    assert np.abs(np.array(llm.scores[:40]) - ours).max() < 1e-2
