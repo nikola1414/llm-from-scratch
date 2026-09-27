@@ -10,6 +10,11 @@ VARIANTS = {
     "gqa": dict(n_kv_head=1),
     "v1-like": dict(pos_emb="learned", norm="layer", mlp="relu", tie_weights=False, bias=True),
     "gelu": dict(mlp="gelu"),
+    "qknorm-softcap": dict(qk_norm=True, logit_softcap=15.0),
+    "value-residual-unet": dict(value_residual=True, unet_skips=True, n_layer=4),
+    "moe": dict(n_experts=4, moe_top_k=2),
+    "everything": dict(n_kv_head=2, qk_norm=True, logit_softcap=30.0, value_residual=True,
+                       unet_skips=True, n_layer=4, n_experts=3, moe_top_k=1),
 }
 
 
@@ -109,10 +114,71 @@ def test_stop_ids():
 def test_overfits_single_batch():
     model = make(dropout=0.0).train()
     x = torch.randint(0, 50, (4, 16))
-    opt = model.configure_optimizer(0.0, 3e-3)
+    (opt,) = model.configure_optimizer(0.0, 3e-3)
     for _ in range(150):
         _, loss = model(x[:, :-1], x[:, 1:])
         opt.zero_grad()
         loss.backward()
         opt.step()
     assert loss.item() < 0.5
+
+
+def test_softcap_bounds_logits():
+    model = make(logit_softcap=2.0)
+    logits, _ = model(torch.randint(0, 50, (1, 16)), torch.randint(0, 50, (1, 16)))
+    assert logits.abs().max() <= 2.0
+
+
+def test_moe_aux_loss_only_in_training():
+    model = make(n_experts=4)
+    x = torch.randint(0, 50, (2, 16))
+    model.eval()
+    _, eval_loss = model(x, x)
+    model.train()
+    _, train_loss = model(x, x)
+    aux = sum(b.mlp.aux_loss for b in model.blocks)
+    assert aux.item() >= 0.99 * 2          # >= 1 per layer (1 = perfectly balanced)
+    assert torch.allclose(train_loss - eval_loss, 0.01 * aux, atol=1e-4)
+
+
+@pytest.mark.parametrize("scaling", ["ntk", "linear", None])
+def test_extend_context(scaling):
+    model = make()
+    model.extend_context(64, scaling)
+    assert model.config.block_size == 64 and model.rope_cos.shape[0] == 64
+    x = torch.randint(0, 50, (1, 64))
+    logits, _ = model(x, x)
+    assert logits.shape == (1, 64, 50)
+    if scaling is None:   # plain extrapolation keeps the first 16 positions identical
+        base = make()
+        a, _ = base(x[:, :16], x[:, :16])
+        assert torch.allclose(logits[:, :16], a, atol=1e-5)
+
+
+def test_extend_context_rejects_learned_positions():
+    with pytest.raises(AssertionError):
+        make(pos_emb="learned").extend_context(64)
+
+
+@pytest.mark.parametrize("optimizer", ["adamw", "muon"])
+def test_optimizers_overfit(optimizer):
+    model = make(dropout=0.0).train()
+    x = torch.randint(0, 50, (4, 16))
+    opts = model.configure_optimizer(0.0, 3e-3, optimizer=optimizer, muon_lr=0.02)
+    assert len(opts) == (2 if optimizer == "muon" else 1)
+    for _ in range(150):
+        _, loss = model(x[:, :-1], x[:, 1:])
+        for o in opts:
+            o.zero_grad()
+        loss.backward()
+        for o in opts:
+            o.step()
+    assert loss.item() < 0.5
+
+
+def test_newton_schulz_orthogonalises():
+    from llm.optim import zeropower_via_newtonschulz5
+    G = torch.randn(32, 64)
+    X = zeropower_via_newtonschulz5(G, steps=10)
+    s = torch.linalg.svdvals(X)
+    assert s.min() > 0.5 and s.max() < 1.5    # singular values pushed towards 1
